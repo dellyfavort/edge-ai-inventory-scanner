@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Vision - Edge AI Inventory Scanner</title>
+    <!-- Impor TensorFlow.js dan COCO-SSD -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+    <style>
+        :root {
+            --bg-card: #ffffff;
+            --border: #e0e0e0;
+            --text-muted: #6c757d;
+            --text-main: #212529;
+            --primary: #0d6efd;
+        }
+
+        body { font-family: sans-serif; padding: 20px; background-color: #f4f6f8; }
+        
+        .main-container { display: flex; flex-wrap: wrap; gap: 20px; }
+        .left-panel { flex: 1; min-width: 300px; max-width: 640px; }
+        .right-panel { flex: 1; min-width: 300px; max-width: 500px; display: flex; flex-direction: column; }
+
+        #camera-container {
+            position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; margin-top: 10px;
+        }
+        #video { width: 100%; height: 100%; object-fit: cover; display: block; }
+        #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        #overlay-msg {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.8); display: flex; justify-content: center; align-items: center; color: white; z-index: 5;
+        }
+        
+        .status-badge { padding: 5px 10px; margin-bottom: 10px; display: inline-block; border-radius: 5px; font-weight: bold; font-size: 14px; }
+        .online { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .demo { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+        
+        .btn { padding: 8px 15px; margin-right: 5px; margin-bottom: 5px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; }
+        .btn-success { background-color: #28a745; color: white; }
+        .btn-danger { background-color: #dc3545; color: white; }
+        .btn-secondary { background-color: #6c757d; color: white; }
+        .btn-primary { background-color: var(--primary); color: white; }
+
+        /* CSS untuk UI Log Deteksi */
+        #data-section {
+            flex: 1; background: var(--bg-card); border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); min-height: 300px; margin-top: 10px;
+        }
+        #data-header {
+            padding: 12px 16px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 14px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center;
+        }
+        #data-list { flex: 1; overflow-y: auto; padding: 8px; max-height: 400px; }
+        .log-item { padding: 10px 12px; background: #f9fafb; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid var(--primary); font-size: 13px; }
+        .log-item .time { color: var(--text-muted); font-size: 11px; display: block; margin-bottom: 4px; }
+        .log-item .items { font-weight: 600; color: var(--text-main); }
+        .empty-state { text-align: center; color: var(--text-muted); padding: 30px; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <h1>Edge AI Inventory Scanner</h1>
+    
+    <div class="main-container">
+        <!-- Panel Kiri: Kamera & Kontrol -->
+        <div class="left-panel">
+            <div id="db-status" class="status-badge">Mengecek Database...</div>
+            
+            <div style="margin-bottom: 10px;">
+                <strong>Jumlah Orang Terdeteksi Saat Ini: </strong> <span id="person-count" style="font-size: 18px; font-weight: bold; color: var(--primary);">0</span>
+            </div>
+            
+            <div>
+                <button class="btn btn-secondary" onclick="startCamera()">Nyala Kamera</button>
+                <button class="btn btn-secondary" onclick="stopCamera()">Mati Kamera</button>
+                <button id="btn-ai" class="btn btn-success">Start AI</button>
+            </div>
+
+            <div id="camera-container">
+                <video id="video" autoplay playsinline muted></video>
+                <canvas id="canvas"></canvas>
+                <div id="overlay-msg"><p id="overlay-text">Memuat Sistem...</p></div>
+            </div>
+        </div>
+
+        <!-- Panel Kanan: Log Database Real-time -->
+        <div class="right-panel">
+            <div>
+                <!-- Tantangan Bonus: Tombol Export CSV -->
+                <button class="btn btn-primary" onclick="exportCSV()">Export Log (CSV)</button>
+            </div>
+            
+            <!-- UI Log Deteksi -->
+            <div id="data-section">
+                <div id="data-header">
+                    <span>Detected Objects Log</span>
+                    <span id="log-count">0 items</span>
+                </div>
+                <div id="data-list">
+                    <div class="empty-state">Menunggu deteksi objek...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- SCRIPT UNTUK DATABASE & FIREBASE V9 (MODUL 1 & 4) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+        import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
+
+        // Setup Mock Database yang disempurnakan (Modul 4) untuk menyimpan ke LocalStorage dan mendukung real-time listener
+        class MockFirestore {
+            constructor() { 
+                this.data = JSON.parse(localStorage.getItem('mock_inventory_db')) || []; 
+                this.listeners = []; 
+            }
+            collection() { return this; }
+            async add(payload) { 
+                const doc = { ...payload, id: Date.now().toString(), timestamp: new Date().toISOString() };
+                this.data.unshift(doc);
+                if (this.data.length > 50) this.data.pop(); // Hemat memori
+                localStorage.setItem('mock_inventory_db', JSON.stringify(this.data));
+                this.listeners.forEach(cb => cb(this.data)); // Trigger listener real-time
+                return Promise.resolve(); 
+            }
+            orderBy() { return this; }
+            limit() { return this; }
+            onSnapshot(cb) {
+                this.listeners.push(cb);
+                cb(this.data); // Trigger initial load
+                return () => {}; 
+            }
+        }
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyAlv7xrhzV0D_Ens0V2gjVkeaB3mvwAHL0",
+            authDomain: "expense-tracker-mahasisw-2313a.firebaseapp.com",
+            projectId: "expense-tracker-mahasisw-2313a",
+            storageBucket: "expense-tracker-mahasisw-2313a.firebasestorage.app",
+            messagingSenderId: "601793984311",
+            appId: "1:601793984311:web:c1f91b2c3aa89beb05ccb2"
+        };
+
+        window.isMockMode = true;
+        const dbStatusEl = document.getElementById('db-status');
+
+        if (firebaseConfig.apiKey) {
+            try {
+                const app = initializeApp(firebaseConfig);
+                window.firebaseDB = getFirestore(app);
+                window.fbAPI = { collection, addDoc, query, orderBy, limit, onSnapshot }; // Ekspos API v9 ke global
+                window.isMockMode = false;
+                dbStatusEl.textContent = "FIREBASE ONLINE (Cloud)";
+                dbStatusEl.className = "status-badge online";
+            } catch (e) { console.error(e); }
+        }
+        
+        if (window.isMockMode) {
+            window.db = new MockFirestore();
+            dbStatusEl.textContent = "DEMO MODE (LocalStorage)";
+            dbStatusEl.className = "status-badge demo";
+        }
+
+        // Mulai mendengarkan database saat halaman dimuat (Init App)
+        setTimeout(listenToDatabase, 500);
+    </script>
+
+    <!-- SCRIPT UNTUK AI, DETEKSI & THROTTLING (MODUL 2, 3 & 4) -->
+    <script>
+        let model = null;
+        let isCameraOn = false;
+        let isAIDetecting = false;
+        
+        // Variabel Throttling
+        let lastSaveTime = 0; 
+        const SAVE_THROTTLE_MS = 3000; // Simpan maksimal setiap 3 detik
+
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const overlayMsg = document.getElementById('overlay-msg');
+        const overlayText = document.getElementById('overlay-text');
+        const btnAI = document.getElementById('btn-ai');
+        const personCountSpan = document.getElementById('person-count');
+
+        // Target deteksi
+        const TARGET_CLASSES = ['person', 'laptop', 'cell phone', 'book', 'mouse', 'glasses', 'bottle']; 
+
+        async function loadModel() {
+            overlayMsg.style.display = 'flex';
+            overlayText.innerText = "Mengunduh Model AI (±5MB)... Mohon tunggu.";
+            try {
+                model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+                console.log("Model berhasil dimuat");
+                overlayText.innerText = "Sistem Siap. Silakan Nyalakan Kamera.";
+            } catch (err) {
+                overlayText.innerText = "Gagal memuat AI. Periksa internet Anda.";
+            }
+        }
+
+        async function startCamera() {
+            if (isCameraOn) return;
+            overlayMsg.style.display = 'flex'; overlayText.innerText = "Membuka kamera...";
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+                });
+                video.srcObject = stream;
+                await new Promise(resolve => { video.onloadedmetadata = () => resolve(); });
+                canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+                isCameraOn = true; overlayMsg.style.display = 'none';
+            } catch (err) { alert("Gagal akses kamera."); }
+        }
+
+        function stopCamera() {
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(t => t.stop());
+                video.srcObject = null;
+                isCameraOn = false; isAIDetecting = false;
+                btnAI.textContent = "Start AI"; btnAI.className = "btn btn-success";
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                personCountSpan.innerText = "0";
+                overlayMsg.style.display = 'flex'; overlayText.innerText = "Kamera Dimatikan";
+            }
+        }
+
+        async function detectLoop() {
+            if (!isAIDetecting || !isCameraOn) return;
+            const predictions = await model.detect(video);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            let currentPersonCount = 0;
+            let detectedTargets = []; 
+
+            predictions.forEach(pred => {
+                const [x, y, w, h] = pred.bbox;
+                const isTarget = TARGET_CLASSES.includes(pred.class);
+                const confidence = pred.score;
+
+                // THRESHOLD DINAMIS MULTIPLE OBJECTS:
+                // Orang butuh keyakinan 65% (0.65), sedangkan benda lain cukup 50% (0.50) agar mudah tertangkap saat dipegang
+                const minConfidence = (pred.class === 'person') ? 0.65 : 0.50;
+
+                if (isTarget && confidence > minConfidence) {
+                    if (pred.class === 'person') currentPersonCount++;
+
+                    // Kumpulkan semua objek target yang terdeteksi untuk database
+                    detectedTargets.push({
+                        class: pred.class,
+                        confidence: parseFloat((confidence * 100).toFixed(0)) 
+                    });
+
+                    // Gambar kotak
+                    ctx.strokeStyle = '#10b981'; ctx.lineWidth = 3; ctx.strokeRect(x, y, w, h);
+                    const label = `${pred.class} ${(confidence * 100).toFixed(0)}%`;
+                    ctx.fillStyle = '#10b981';
+                    ctx.fillRect(x, y - 25, ctx.measureText(label).width + 10, 25);
+                    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 14px sans-serif';
+                    ctx.fillText(label, x + 5, y - 7);
+                }
+            });
+
+            personCountSpan.innerText = currentPersonCount;
+
+            // THROTTLING: Hanya simpan jika sudah lewat 3 detik dan ada objek
+            if (detectedTargets.length > 0 && (Date.now() - lastSaveTime > SAVE_THROTTLE_MS)) {
+                saveToDatabase(detectedTargets); 
+                lastSaveTime = Date.now(); // Update waktu terakhir simpan
+            }
+
+            requestAnimationFrame(detectLoop);
+        }
+
+        btnAI.addEventListener('click', () => {
+            if (!model) { alert("Model AI belum dimuat."); return; }
+            if (!isCameraOn) { alert("Nyalakan kamera terlebih dahulu."); return; }
+            if (!isAIDetecting) {
+                isAIDetecting = true; btnAI.textContent = "Stop AI"; btnAI.className = "btn btn-danger"; detectLoop();
+            } else {
+                isAIDetecting = false; btnAI.textContent = "Start AI"; btnAI.className = "btn btn-success";
+                ctx.clearRect(0, 0, canvas.width, canvas.height); personCountSpan.innerText = "0";
+            }
+        });
+
+        // -------------------------------------------------------------
+        // FUNGSI DATABASE & LOG REAL-TIME (MODUL 4)
+        // -------------------------------------------------------------
+
+        // 1. Fungsi Menyimpan Hasil Deteksi
+        async function saveToDatabase(data) {
+            // Format data menjadi string yang mudah dibaca, contoh: "laptop (95%), person (87%)"
+            const itemsString = data.map(d => `${d.class} (${d.confidence}%)`).join(', '); 
+            
+            const payload = {
+                items: itemsString,               
+                count: data.length,               
+                device_id: 'BROWSER-TEST',        
+                timestamp: new Date().toISOString() // Simpan waktu deteksi
+            };
+
+            try {
+                if (window.isMockMode) {
+                    await window.db.add(payload);
+                } else {
+                    // Firebase Mode v9
+                    const { collection, addDoc } = window.fbAPI;
+                    await addDoc(collection(window.firebaseDB, 'inventory_logs'), payload);
+                }
+                console.log("Data tersimpan ke database:", payload); 
+            } catch (err) {
+                console.error("Gagal menyimpan ke database:", err); 
+            }
+        }
+
+        // 2. Real-time Listener dengan onSnapshot
+        function listenToDatabase() {
+            if (window.isMockMode) {
+                // Mock Mode Listener
+                window.db.onSnapshot(docs => renderLogs(docs));
+            } else {
+                // Firebase Mode v9 Listener
+                const { collection, query, orderBy, limit, onSnapshot } = window.fbAPI;
+                const q = query(collection(window.firebaseDB, 'inventory_logs'), orderBy('timestamp', 'desc'), limit(30)); 
+                onSnapshot(q, (snapshot) => {
+                    const docs = snapshot.docs.map(doc => doc.data());
+                    renderLogs(docs);
+                });
+            }
+        }
+
+        // 3. Render Log ke UI
+        function renderLogs(docs) {
+            const dataList = document.getElementById('data-list'); 
+            const logCount = document.getElementById('log-count');
+            dataList.innerHTML = ''; // Kosongkan list sebelum render ulang
+            let count = 0; 
+
+            docs.forEach(data => {
+                count++; 
+                const div = document.createElement('div'); 
+                div.className = 'log-item'; 
+                
+                // Format timestamp
+                const dateObj = new Date(data.timestamp);
+                const timeStr = dateObj.toLocaleTimeString('id-ID');
+
+                div.innerHTML = `
+                    <span class="time">${timeStr} | ${data.device_id}</span>
+                    <span class="items">${data.items} (${data.count} objek)</span>
+                `;
+                dataList.appendChild(div); 
+            });
+
+            // Update counter
+            logCount.textContent = `${count} items`; 
+
+            // Tampilkan empty state jika tidak ada data
+            if (count === 0) {
+                dataList.innerHTML = '<div class="empty-state">Belum ada objek terdeteksi...</div>'; 
+            }
+        }
+
+        // 4. Tantangan Bonus: Export Log CSV
+        function exportCSV() {
+            let dataToExport = [];
+            if (window.isMockMode) {
+                dataToExport = JSON.parse(localStorage.getItem('mock_inventory_db')) || [];
+            } else {
+                alert("Export saat ini dioptimalkan untuk Mock Mode (LocalStorage).");
+                return;
+            }
+
+            if (dataToExport.length === 0) {
+                alert("Tidak ada data log yang bisa diekspor.");
+                return;
+            }
+
+            let csvContent = "data:text/csv;charset=utf-8,";
+            csvContent += "Waktu Deteksi,Jumlah Objek,Item Terdeteksi,Device ID\n"; // Header CSV
+
+            dataToExport.forEach(row => {
+                const time = new Date(row.timestamp).toLocaleString('id-ID');
+                csvContent += `"${time}","${row.count}","${row.items}","${row.device_id}"\n`;
+            });
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "log_deteksi_ai.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        // Jalankan saat halaman dibuka
+        window.onload = loadModel; 
+    </script>
+</body>
+</html>
